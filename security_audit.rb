@@ -2,6 +2,25 @@
 require 'open3'
 require 'json'
 
+require 'optparse'
+
+# Default: do not run sudo commands
+options = {}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: security_audit.rb [options]"
+
+  opts.on("-s", "--sudo", "Run privileged checks (requires sudo)") do
+    options[:use_sudo] = true
+  end
+
+  opts.on("-h", "--help", "Prints this help") do
+    puts opts
+    exit
+  end
+end.parse!
+
+
 ##############################################
 # CONFIGURATION
 ##############################################
@@ -36,10 +55,6 @@ def section(title)
   puts "\n\n=== #{title} ==="
 end
 
-def run(command)
-  stdout, stderr, status = Open3.capture3(command)
-  stdout
-end
 
 ##############################################
 # 1. UNIFIED LOG SCAN (last 12h)
@@ -49,6 +64,19 @@ end
 LOG_OUTPUT = "unified_capture_audit.log"
 
 class Audit
+
+  def initialize(options)
+    @use_sudo = options[:use_sudo]
+  end
+
+  def run(command)
+    if !@use_sudo && command.strip.start_with?("sudo")
+      return "[INFO] Skipped privileged command because @use_sudo is false: #{command}"
+    end
+
+    stdout, stderr, status = Open3.capture3(command)
+    stdout
+  end
 
   def analyze_log_dump
     section("Analyzing Unified Log Dump...")
@@ -210,6 +238,91 @@ class Audit
     puts run("osascript -e 'tell application \"System Events\" to get the name of every login item'")
   end
 
+  def check_sip
+    section("System Integrity Protection (SIP)")
+    sip_status = run("csrutil status").strip
+    puts sip_status
+  end
+
+  def check_system_files
+    section("System File Integrity Check")
+    output = run("sudo /usr/libexec/repair_packages --verify --standard-pkgs /")
+    if output.empty?
+      puts "System files verified"
+    else
+      puts output
+    end
+  end
+
+  def check_gatekeeper
+    section("Gatekeeper Status")
+    status = run("spctl --status").strip
+    puts status
+  end
+
+  def check_unsigned_apps
+    section("Unsigned Applications")
+    apps = Dir.glob("/Applications/**/*.app")
+    apps.each do |app|
+      bin = File.join(app, "Contents/MacOS", File.basename(app, ".app"))
+      next unless File.exist?(bin)
+      sig = run(%Q(codesign -dv "#{bin}" 2>&1))
+      puts "[UNSIGNED] #{bin}" if sig =~ /code object is not signed/
+    end
+
+    def audit_all_tcc
+      section("Full TCC Permissions")
+      db = File.expand_path("~/Library/Application Support/com.apple.TCC/TCC.db")
+      return puts "TCC DB not found" unless File.exist?(db)
+      query = "SELECT service, client, allowed FROM access;"
+      output = run(%Q(sqlite3 "#{db}" '#{query}'))
+      puts output
+    end
+
+    def audit_open_ports
+      section("Listening TCP Ports")
+      puts run("sudo lsof -iTCP -sTCP:LISTEN -nP")
+    end
+
+    def audit_active_connections
+      section("Active TCP Connections")
+      puts run("lsof -iTCP -sTCP:ESTABLISHED -nP")
+    end
+
+    def check_firewall
+      section("Firewall Status")
+      puts run("sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate")
+    end
+
+    def check_cron
+      section("User & System Cron Jobs")
+      puts "User cron:"
+      puts run("crontab -l")
+      puts "\nSystem cron:"
+      puts run("sudo crontab -l")
+    end
+
+    def check_known_adware
+      section("Known Adware / PUP Paths")
+      suspicious_paths = [
+        "/Library/Application Support/Adobe",
+        "/Library/LaunchAgents/com.genericadware.*",
+        "~/Library/LaunchAgents/com.genericadware.*"
+      ]
+      suspicious_paths.each do |path|
+        puts Dir.glob(path)
+      end
+    end
+
+    def recent_launches
+      section("Recent Launch Events (last 24h)")
+      puts run("log show --last 1d --predicate 'eventMessage CONTAINS[c] \"launchd\"' | grep -v '(com.apple|Google|Adobe|Zoom)'")
+    end
+
+  end
+
+
+
   def exec
     ##############################################
     # MASTER EXECUTION
@@ -221,14 +334,26 @@ class Audit
     detect_event_taps
     audit_network
     check_persistence
+    check_sip
+    check_system_files
+    check_gatekeeper
+    check_unsigned_apps
+    audit_all_tcc
+    audit_open_ports
+    audit_active_connections
+    check_firewall
+    check_cron
+    check_sip
+    check_known_adware
+    recent_launches
 
     puts "\n\n=== AUDIT COMPLETE ==="
   end
 
-  auditor = Audit.new
-  auditor.exec
-
 end
+
+auditor = Audit.new(options)
+auditor.exec
 
 
 
