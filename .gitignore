@@ -1,0 +1,4 @@
+*.rb
+!security_audit.rb
+
+*.log
